@@ -1,0 +1,304 @@
+import { getColor } from './src/config/bot.js';
+import {
+    SlashCommandBuilder,
+    PermissionFlagsBits,
+    PermissionsBitField,
+    ChannelType,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    MessageFlags,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle,
+    RoleSelectMenuBuilder,
+    UserSelectMenuBuilder,
+    ComponentType,
+    EmbedBuilder,
+} from 'discord.js';
+import { createEmbed, errorEmbed, successEmbed, infoEmbed, warningEmbed } from './src/utils/embeds.js';
+import { getGuildConfig } from './src/services/guildConfig.js';
+import { InteractionHelper } from './src/utils/interactionHelper.js';
+import { logger } from './src/utils/logger.js';
+import { handleInteractionError } from './src/utils/errorHandler.js';
+import { getGuildConfigKey } from './src/utils/database.js';
+
+export const customTicketSetup = {
+    data: new SlashCommandBuilder()
+        .setName("ticket_custom")
+        .setDescription("Custom ticket setup with mention roles and multiple buttons.")
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+        .addSubcommand((subcommand) =>
+            subcommand
+                .setName("setup")
+                .setDescription("Sets up the custom ticket creation panel.")
+                .addChannelOption((option) =>
+                    option
+                        .setName("panel_channel")
+                        .setDescription("The channel where the ticket panel will be sent.")
+                        .addChannelTypes(ChannelType.GuildText)
+                        .setRequired(true)
+                )
+                .addStringOption((option) =>
+                    option
+                        .setName("panel_message")
+                        .setDescription("The main message for the ticket panel.")
+                        .setRequired(true)
+                )
+                .addRoleOption((option) =>
+                    option
+                        .setName("mention_role_1")
+                        .setDescription("First role to mention when a ticket is created.")
+                        .setRequired(false)
+                )
+                .addRoleOption((option) =>
+                    option
+                        .setName("mention_role_2")
+                        .setDescription("Second role to mention when a ticket is created.")
+                        .setRequired(false)
+                )
+                .addStringOption((option) =>
+                    option
+                        .setName("button_1_label")
+                        .setDescription("Label for first button (default: Support Ticket)")
+                        .setRequired(false)
+                )
+                .addStringOption((option) =>
+                    option
+                        .setName("button_2_label")
+                        .setDescription("Label for second button (default: Report Issue)")
+                        .setRequired(false)
+                )
+                .addChannelOption((option) =>
+                    option
+                        .setName("category")
+                        .setDescription("Category where new tickets will be created.")
+                        .addChannelTypes(ChannelType.GuildCategory)
+                        .setRequired(false)
+                )
+        )
+        .addSubcommand((subcommand) =>
+            subcommand
+                .setName("add_user")
+                .setDescription("Add a user to an existing ticket.")
+                .addUserOption((option) =>
+                    option
+                        .setName("user")
+                        .setDescription("The user to add to the ticket.")
+                        .setRequired(true)
+                )
+        ),
+    category: "ticket",
+
+    async execute(interaction, config, client) {
+        try {
+            const deferred = await InteractionHelper.safeDefer(interaction, { flags: MessageFlags.Ephemeral });
+            if (!deferred) return;
+
+            if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
+                return await InteractionHelper.safeEditReply(interaction, {
+                    embeds: [
+                        errorEmbed(
+                            "Permission Denied",
+                            "You need the `Manage Channels` permission for this action."
+                        )
+                    ]
+                });
+            }
+
+            const subcommand = interaction.options.getSubcommand();
+
+            if (subcommand === "setup") {
+                await handleCustomSetup(interaction, config, client);
+            } else if (subcommand === "add_user") {
+                await handleAddUser(interaction, config, client);
+            }
+        } catch (error) {
+            logger.error('Error executing custom ticket command', {
+                error: error.message,
+                stack: error.stack,
+                userId: interaction.user.id,
+                guildId: interaction.guildId
+            });
+            await handleInteractionError(interaction, error, {
+                commandName: 'ticket_custom',
+                source: 'ticket_custom_command'
+            });
+        }
+    }
+};
+
+async function handleCustomSetup(interaction, config, client) {
+    const panelChannel = interaction.options.getChannel("panel_channel");
+    const categoryChannel = interaction.options.getChannel("category");
+    const mentionRole1 = interaction.options.getRole("mention_role_1");
+    const mentionRole2 = interaction.options.getRole("mention_role_2");
+    const panelMessage = interaction.options.getString("panel_message") || "Choose a ticket type below to get started!";
+    const button1Label = interaction.options.getString("button_1_label") || "Support Ticket";
+    const button2Label = interaction.options.getString("button_2_label") || "Report Issue";
+
+    const setupEmbed = createEmbed({
+        title: "🎫 Custom Support Tickets",
+        description: panelMessage,
+        color: getColor('info')
+    });
+
+    const buttonsRow1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId("custom_ticket_support")
+            .setLabel(button1Label)
+            .setStyle(ButtonStyle.Primary)
+            .setEmoji("🛟"),
+        new ButtonBuilder()
+            .setCustomId("custom_ticket_report")
+            .setLabel(button2Label)
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji("⚠️")
+    );
+
+    try {
+        await panelChannel.send({
+            embeds: [setupEmbed],
+            components: [buttonsRow1]
+        });
+
+        const existingConfig = await getGuildConfig(client, interaction.guildId);
+        existingConfig.customTicketMentionRoles = [
+            mentionRole1?.id,
+            mentionRole2?.id
+        ].filter(Boolean);
+        existingConfig.customTicketCategoryId = categoryChannel?.id || null;
+        existingConfig.customTicketPanelChannelId = panelChannel.id;
+
+        await client.db.set(getGuildConfigKey(interaction.guildId), existingConfig);
+
+        let successMessage = `Custom ticket panel sent to ${panelChannel}! `;
+        if (categoryChannel) successMessage += `Tickets will be created in ${categoryChannel.name}. `;
+        if (mentionRole1 || mentionRole2) {
+            successMessage += `\nRoles to mention: ${[mentionRole1, mentionRole2].filter(Boolean).map(r => r.name).join(', ')}`;
+        }
+
+        await InteractionHelper.safeEditReply(interaction, {
+            embeds: [successEmbed("Custom Ticket Panel Set Up", successMessage)]
+        });
+
+        logger.info('Custom ticket panel setup completed', {
+            guildId: interaction.guildId,
+            panelChannelId: panelChannel.id
+        });
+    } catch (error) {
+        logger.error('Custom ticket setup error', {
+            error: error.message,
+            stack: error.stack
+        });
+        await InteractionHelper.safeEditReply(interaction, {
+            embeds: [errorEmbed("Setup Failed", "Could not send the custom ticket panel.")]
+        });
+    }
+}
+
+async function handleAddUser(interaction, config, client) {
+    const targetUser = interaction.options.getUser("user");
+    const channel = interaction.channel;
+
+    if (!channel.name.startsWith('ticket-') && !channel.topic?.includes('ticket')) {
+        return await InteractionHelper.safeEditReply(interaction, {
+            embeds: [errorEmbed("Not a Ticket", "This command can only be used in ticket channels.")]
+        });
+    }
+
+    try {
+        await channel.permissionOverwrites.edit(targetUser, {
+            ViewChannel: true,
+            SendMessages: true,
+            ReadMessageHistory: true
+        });
+
+        await InteractionHelper.safeEditReply(interaction, {
+            embeds: [successEmbed("User Added", `${targetUser} has been added to this ticket!`)]
+        });
+
+        await channel.send({
+            embeds: [infoEmbed("User Added", `${targetUser} has been added to this ticket by ${interaction.user}.`)]
+        });
+    } catch (error) {
+        logger.error('Error adding user to ticket', { error: error.message });
+        await InteractionHelper.safeEditReply(interaction, {
+            embeds: [errorEmbed("Failed to Add User", "Could not add the user to this ticket. Check permissions.")]
+        });
+    }
+}
+
+export const customTicketButtonHandler = {
+    async handle(interaction, client) {
+        if (!interaction.isButton()) return;
+        
+        const customId = interaction.customId;
+        if (!customId.startsWith('custom_ticket_')) return;
+
+        try {
+            await interaction.deferReply({ ephemeral: true });
+            const config = await getGuildConfig(client, interaction.guildId);
+            const ticketType = customId.replace('custom_ticket_', '');
+
+            const categoryId = config.customTicketCategoryId;
+            const mentionRoles = config.customTicketMentionRoles || [];
+
+            const category = categoryId 
+                ? interaction.guild.channels.cache.get(categoryId) 
+                : null;
+
+            const ticketChannel = await interaction.guild.channels.create({
+                name: `ticket-${interaction.user.username}`,
+                type: ChannelType.GuildText,
+                parent: category?.id,
+                permissionOverwrites: [
+                    {
+                        id: interaction.guild.id,
+                        deny: [PermissionsBitField.Flags.ViewChannel]
+                    },
+                    {
+                        id: interaction.user.id,
+                        allow: [
+                            PermissionsBitField.Flags.ViewChannel,
+                            PermissionsBitField.Flags.SendMessages,
+                            PermissionsBitField.Flags.ReadMessageHistory
+                        ]
+                    }
+                ]
+            });
+
+            const mentionText = mentionRoles.map(id => `<@&${id}>`).join(' ');
+            
+            const ticketEmbed = createEmbed({
+                title: `🎫 ${ticketType === 'support' ? 'Support Ticket' : 'Issue Report'}`,
+                description: `Hello ${interaction.user}! Thank you for opening a ticket.\n\n${mentionText}`,
+                color: getColor('success')
+            });
+
+            const closeButton = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId('close_ticket')
+                    .setLabel('Close Ticket')
+                    .setStyle(ButtonStyle.Danger)
+                    .setEmoji('🔒')
+            );
+
+            await ticketChannel.send({
+                content: mentionText,
+                embeds: [ticketEmbed],
+                components: [closeButton]
+            });
+
+            await interaction.editReply({
+                embeds: [successEmbed("Ticket Created!", `Your ticket has been created: ${ticketChannel}`)]
+            });
+
+        } catch (error) {
+            logger.error('Error creating custom ticket', { error: error.message });
+            await interaction.editReply({
+                embeds: [errorEmbed("Failed to Create Ticket", "An error occurred while creating your ticket.")]
+            });
+        }
+    }
+};
